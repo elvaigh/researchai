@@ -26,11 +26,17 @@ def _build_url() -> str:
     host     = cfg.DB_HOST
     port     = cfg.DB_PORT
     dbname   = cfg.DB_NAME
-    return (
+    # DB_OPTIONS handles Neon SNI workaround: set to "endpoint=ep-xxxx"
+    options  = cfg.DB_OPTIONS
+    url = (
         f"postgresql+psycopg2://{user}:{password}"
         f"@{host}:{port}/{dbname}"
         f"?sslmode=require"
     )
+    if options:
+        from urllib.parse import quote
+        url += f"&options={quote(options)}"
+    return url
 
 
 def _get_engine():

@@ -42,6 +42,10 @@ class _Config:
     def SECRET_KEY(self) -> str:
         return _get("SECRET_KEY", "dev-secret")
     @property
+    def DB_OPTIONS(self) -> str:
+        return _get("DB_OPTIONS", "")
+
+    @property
     def APP_NAME(self) -> str:
         return _get("APP_NAME", "ResearchAI")
 
