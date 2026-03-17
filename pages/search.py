@@ -59,7 +59,7 @@ def render():
                                         index=1, key="result_count",
                                         label_visibility="collapsed")
         src_options = ["Semantic Scholar", "OpenAlex", "arXiv", "CrossRef",
-                         "Google Scholar", "PubMed", "Europe PMC"]
+                         "Google Scholar", "Google Search", "PubMed", "Europe PMC"]
         selected_sources = []
         # Row 1: 4 sources
         row1 = src_options[:4]
@@ -90,8 +90,9 @@ def render():
         search_btn = st.button("Search", type="primary", use_container_width=True)
 
     # Quick suggestions
-    sugg_cols = st.columns(4)
+    sugg_cols = st.columns(5)
     for i, s in enumerate([
+        "parchment usage in middle ages",
         "transformer attention mechanisms",
         "graph neural networks knowledge",
         "contrastive learning vision",
@@ -112,7 +113,7 @@ def render():
         st.session_state.sr_pending = ""
 
     if run_query:
-        with st.status("🤖 Expanding query · Searching 7 sources · Re-ranking by AI…", expanded=False) as status:
+        with st.status("🤖 Expanding query · Searching 8 sources · Re-ranking by AI…", expanded=False) as status:
             # Fetch more than needed so client-side filters still leave enough results
             results, error = search_papers(run_query, limit=result_count)
 

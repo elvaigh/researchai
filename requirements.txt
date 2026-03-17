@@ -7,4 +7,6 @@ bcrypt>=4.1.2
 requests>=2.31.0
 PyPDF2>=3.0.1
 numpy>=1.26.0
+faiss-cpu>=1.7.4
 scholarly>=1.7.11
+googlesearch-python>=1.2.3

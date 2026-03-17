@@ -20,6 +20,7 @@ Other features:
 """
 
 import os, re, json, time, math
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import requests
@@ -63,6 +64,16 @@ PUBMED_URL  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 EPMC_URL    = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 SS_FIELDS   = ("title,authors,abstract,year,externalIds,"
                "openAccessPdf,isOpenAccess,citationCount,influentialCitationCount")
+
+# Academic domains targeted by Google Search
+_ACADEMIC_DOMAINS = (
+    "arxiv.org", "semanticscholar.org", "researchgate.net",
+    "scholar.google.com", "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov",
+    "sciencedirect.com", "springer.com", "nature.com", "ieee.org",
+    "acm.org", "wiley.com", "tandfonline.com", "jstor.org",
+    "plos.org", "frontiersin.org", "mdpi.com", "biorxiv.org",
+    "ssrn.com", "hal.science", "openreview.net", "dl.acm.org",
+)
 
 WRITING_SECTIONS = {
     "abstract":     "Write a structured academic abstract (150–250 words): background, objective, methods, results, conclusion.",
@@ -333,6 +344,202 @@ def _fetch_google_scholar(query: str, limit: int) -> list:
         return []
 
 
+def _fetch_google_search(query: str, limit: int) -> list:
+    """
+    Google Search for academic papers via googlesearch-python.
+    Searches academic domains, then fetches each page to extract
+    metadata (title, authors, abstract, year, DOI).
+
+    Falls back to SerpAPI if SERPAPI_KEY is set in secrets.
+    Returns [] gracefully on any error (rate-limit, network, etc.).
+    """
+    # Build an academic-site query
+    site_filter = " OR ".join(f"site:{d}" for d in _ACADEMIC_DOMAINS[:8])
+    full_query  = f"{query} ({site_filter})"
+
+    urls = []
+
+    # --- Strategy A: SerpAPI (if key configured) ---
+    try:
+        from utils.config import cfg as _cfg
+        serpapi_key = _cfg.SERPAPI_KEY
+    except Exception:
+        serpapi_key = ""
+
+    if serpapi_key:
+        try:
+            resp = requests.get(
+                "https://serpapi.com/search.json",
+                params={"engine": "google", "q": full_query,
+                        "num": limit, "api_key": serpapi_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            for r in resp.json().get("organic_results", []):
+                u = r.get("link") or ""
+                if u:
+                    urls.append((u, r.get("title",""), r.get("snippet","")))
+        except Exception:
+            pass
+
+    # --- Strategy B: googlesearch-python (free, no key) ---
+    if not urls:
+        try:
+            from googlesearch import search as _gsearch
+            for u in _gsearch(full_query, num_results=limit, sleep_interval=0.5):
+                urls.append((u, "", ""))
+        except Exception:
+            pass
+
+    if not urls:
+        return []
+
+    out = []
+    for url, gs_title, gs_snippet in urls[:limit]:
+        if len(out) >= limit:
+            break
+        paper = _process_google_result(url, gs_title, gs_snippet)
+        if paper:
+            out.append(paper)
+
+    return out
+
+
+def _process_google_result(url: str, gs_title: str, gs_snippet: str) -> dict | None:
+    """
+    Turn a Google Search result URL into a structured paper dict.
+    Strategy:
+      1. If it's an arXiv URL → use arXiv API directly (fast, reliable)
+      2. If it's a DOI URL   → use CrossRef to get metadata
+      3. Otherwise           → fetch the page HTML and extract metadata
+         using a fast heuristic parser, with GPT fallback on the snippet.
+    Returns None if no usable metadata could be extracted.
+    """
+    url = url.strip()
+
+    # ── arXiv fast path ──────────────────────────────────────────────────
+    arxiv_match = re.search(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]+(?:v\d+)?)", url)
+    if arxiv_match:
+        arxiv_id = arxiv_match.group(1).replace(".pdf","")
+        try:
+            import xml.etree.ElementTree as ET
+            r = requests.get(
+                f"http://export.arxiv.org/api/query?id_list={arxiv_id}",
+                timeout=8,
+            )
+            r.raise_for_status()
+            ns   = "http://www.w3.org/2005/Atom"
+            root = ET.fromstring(r.content)
+            e    = root.find(f"{{{ns}}}entry")
+            if e is not None:
+                title    = _clean_text(e.findtext(f"{{{ns}}}title") or "")
+                abstract = _clean_text(e.findtext(f"{{{ns}}}summary") or "")
+                authors  = ", ".join(
+                    (a.findtext(f"{{{ns}}}name") or "")
+                    for a in e.findall(f"{{{ns}}}author")[:8]
+                )
+                year = (e.findtext(f"{{{ns}}}published") or "")[:4]
+                doi_el = e.find("{http://arxiv.org/schemas/atom}doi")
+                doi = (doi_el.text or "") if doi_el is not None else ""
+                if title and authors and abstract:
+                    return _norm_paper(
+                        title=title, authors=authors, abstract=abstract,
+                        year=year, doi=doi, source="Google Search",
+                        url=f"https://arxiv.org/abs/{arxiv_id}",
+                        is_open_access=True,
+                    )
+        except Exception:
+            pass
+
+    # ── DOI fast path ─────────────────────────────────────────────────────
+    doi_match = re.search(r"(?:doi\.org/|/doi/)(10\.\d{4,}/\S+)", url)
+    doi = doi_match.group(1).rstrip(".,)") if doi_match else ""
+    if doi:
+        try:
+            r = requests.get(
+                f"https://api.crossref.org/works/{doi}",
+                timeout=8,
+            )
+            if r.status_code == 200:
+                msg = r.json().get("message", {})
+                title = ((msg.get("title") or [""])[0])
+                authors = ", ".join(
+                    f"{a.get('given','')} {a.get('family','')}".strip()
+                    for a in (msg.get("author") or [])[:8]
+                )
+                abstract = re.sub(r"<[^>]+>", " ",
+                                  msg.get("abstract") or "").strip()
+                pub   = msg.get("published") or {}
+                parts = (pub.get("date-parts") or [[]])[0]
+                year  = str(parts[0]) if parts else ""
+                if title and authors:
+                    return _norm_paper(
+                        title=_clean_text(title),
+                        authors=_clean_text(authors),
+                        abstract=_clean_text(abstract),
+                        year=year, doi=doi,
+                        source="Google Search",
+                        url=url or f"https://doi.org/{doi}",
+                    )
+        except Exception:
+            pass
+
+    # ── Generic page fetch + GPT extraction ───────────────────────────────
+    # Only attempt for known academic domains
+    if not any(d in url for d in _ACADEMIC_DOMAINS):
+        return None
+
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; ResearchAI/2.0)"}
+        r = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
+        if r.status_code != 200:
+            raise ValueError(f"HTTP {r.status_code}")
+        html = r.text[:6000]  # only need the head section
+    except Exception:
+        # Fall back to extracting from Google snippet alone
+        html = ""
+
+    # Strip HTML tags to get readable text
+    text_content = re.sub(r"<[^>]+>", " ", html)
+    text_content = re.sub(r"\s+", " ", text_content).strip()[:3000]
+
+    # Use gs_snippet if page fetch failed
+    source_text = text_content if text_content else gs_snippet
+    if not source_text:
+        return None
+
+    # Ask GPT to extract structured metadata from the page text
+    json_template = '{"title":"","authors":"Author1, Author2","abstract":"","year":"YYYY","doi":""}'
+    prompt = (
+        "Extract academic paper metadata from this text. "
+        "URL: " + url + "\n\nTEXT:\n" + source_text + "\n\n"
+        "Return JSON only:\n"
+        + json_template + "\n"
+        "Return empty string for unknown fields. JSON only, no explanation."
+    )
+    raw = _gpt([{"role": "user", "content": prompt}],
+               max_tokens=400, temperature=0.1)
+    try:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            return None
+        data = json.loads(m.group())
+        title    = _clean_text(data.get("title",""))
+        authors  = _clean_text(data.get("authors",""))
+        abstract = _clean_text(data.get("abstract",""))
+        year     = str(data.get("year","")).strip()
+        doi      = str(data.get("doi","")).strip()
+        if title and authors and abstract:
+            return _norm_paper(
+                title=title, authors=authors, abstract=abstract,
+                year=year, doi=doi, source="Google Search", url=url,
+            )
+    except Exception:
+        pass
+
+    return None
+
+
 def _fetch_pubmed(query: str, limit: int) -> list:
     """PubMed via NCBI E-utilities (free, no key needed for ≤3 req/s)."""
     try:
@@ -450,52 +657,111 @@ def _fetch_europe_pmc(query: str, limit: int) -> list:
 # STEP 3 — Embedding-based semantic re-ranking
 # ══════════════════════════════════════════════════════════════════════════
 
-def _embed(texts: list[str]) -> list[list[float]]:
-    """Get text-embedding-3-small embeddings for a list of texts."""
+# ── FAISS-powered semantic re-ranking ─────────────────────────────────────
+# text-embedding-3-small produces 1536-dim vectors.
+# We use a flat inner-product index (IndexFlatIP) on L2-normalised vectors
+# which is equivalent to cosine similarity — O(n) but with FAISS SIMD
+# acceleration, ~10–50x faster than a pure-Python loop.
+_EMBED_DIM = 1536
+
+
+def _embed(texts: list[str]) -> np.ndarray | None:
+    """
+    Call OpenAI text-embedding-3-small and return an (N, 1536) float32 array.
+    Returns None on failure.
+    """
     c = _get_client()
     if not c or not texts:
-        return []
+        return None
     try:
-        resp = c.embeddings.create(
-            model="text-embedding-3-small",
-            input=[t[:8000] for t in texts],
-        )
-        return [item.embedding for item in resp.data]
+        # Batch in chunks of 256 to stay within API limits
+        all_vecs = []
+        chunk_size = 256
+        for i in range(0, len(texts), chunk_size):
+            batch = [t[:8000] for t in texts[i:i + chunk_size]]
+            resp  = c.embeddings.create(model="text-embedding-3-small", input=batch)
+            all_vecs.extend([item.embedding for item in resp.data])
+        arr = np.array(all_vecs, dtype=np.float32)
+        return arr
     except Exception:
-        return []
+        return None
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    if not a or not b:
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na  = math.sqrt(sum(x * x for x in a))
-    nb  = math.sqrt(sum(x * x for x in b))
-    return dot / (na * nb) if na and nb else 0.0
+def _l2_normalise(vecs: np.ndarray) -> np.ndarray:
+    """L2-normalise rows so inner product == cosine similarity."""
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)   # avoid div-by-zero
+    return vecs / norms
 
 
 def _rerank(query: str, papers: list[dict]) -> list[dict]:
     """
-    Embed query and each paper's title+abstract, then sort descending by
-    cosine similarity. Falls back to original order if embeddings fail.
+    Rank papers by semantic similarity to the query using FAISS.
+
+    Pipeline:
+      1. Embed query + all paper texts in a single batched API call
+      2. L2-normalise all vectors
+      3. Build a FAISS IndexFlatIP (exact inner product = cosine on unit vecs)
+      4. Query the index with the query vector → ordered similarity scores
+      5. Attach _score to each paper and return sorted list
+
+    Falls back to the original order if embeddings or FAISS are unavailable.
     """
     if not papers:
         return papers
 
-    texts = [f"{p['title']} {p['abstract']}"[:1000] for p in papers]
-    all_texts = [query] + texts
-    embeddings = _embed(all_texts)
+    # Build text representations
+    texts = [
+        (p.get("title") or "") + " " + (p.get("abstract") or "")
+        for p in papers
+    ]
+    texts = [t[:1200] for t in texts]   # cap per text for speed
 
-    if len(embeddings) < 2:
+    all_texts = [query] + texts
+    vecs = _embed(all_texts)
+
+    if vecs is None or len(vecs) < 2:
+        # No embeddings — return original order with score=0
+        for p in papers:
+            p["_score"] = 0.0
         return papers
 
-    query_emb  = embeddings[0]
-    paper_embs = embeddings[1:]
+    # L2-normalise so IP == cosine
+    vecs = _l2_normalise(vecs)
 
-    for i, paper in enumerate(papers):
-        paper["_score"] = _cosine(query_emb, paper_embs[i]) if i < len(paper_embs) else 0.0
+    query_vec  = vecs[0:1]          # shape (1, dim)
+    paper_vecs = vecs[1:]           # shape (N, dim)
 
-    papers.sort(key=lambda p: p.get("_score", 0.0), reverse=True)
+    try:
+        import faiss
+
+        # Build flat index (exact search, no approximation needed at N<5000)
+        index = faiss.IndexFlatIP(_EMBED_DIM)
+        index.add(paper_vecs)                           # add all paper vectors
+
+        # Search: retrieve all N results sorted by similarity
+        scores, indices = index.search(query_vec, len(papers))
+
+        scores  = scores[0]    # flatten to (N,)
+        indices = indices[0]
+
+        # Attach scores and reorder papers
+        score_map = {int(idx): float(score)
+                     for idx, score in zip(indices, scores)
+                     if idx >= 0}
+
+        for i, paper in enumerate(papers):
+            paper["_score"] = score_map.get(i, 0.0)
+
+        papers.sort(key=lambda p: p.get("_score", 0.0), reverse=True)
+
+    except ImportError:
+        # FAISS not installed — fall back to numpy dot product
+        scores = (paper_vecs @ query_vec.T).flatten()
+        for i, paper in enumerate(papers):
+            paper["_score"] = float(scores[i]) if i < len(scores) else 0.0
+        papers.sort(key=lambda p: p.get("_score", 0.0), reverse=True)
+
     return papers
 
 
@@ -565,36 +831,63 @@ def search_papers(query: str, limit: int = 20,
         "arXiv":            _fetch_arxiv,
         "CrossRef":         _fetch_crossref,
         "Google Scholar":   _fetch_google_scholar,
+        "Google Search":    _fetch_google_search,
         "PubMed":           _fetch_pubmed,
         "Europe PMC":       _fetch_europe_pmc,
     }
     active = {k: v for k, v in all_sources.items()
               if sources is None or k in sources}
 
-    # Step 1: expand query
-    variants = _expand_query(query)
-
     # Tune per-variant fetch count based on desired final count
     if limit <= 20:
-        per_variant = 15
+        per_variant = 12
     elif limit <= 50:
-        per_variant = 25
+        per_variant = 20
     else:
-        per_variant = 40
+        per_variant = 30
 
-    # Step 2: parallel fetch — each source × each query variant
+    # Steps 1+2 run concurrently:
+    # • GPT query expansion fires immediately
+    # • All sources are also queried with the original query right away
+    # • When expansion finishes, variant queries are added to the pool
+    # This means we don't wait for GPT before starting source fetches.
     all_papers = []
-    with ThreadPoolExecutor(max_workers=min(16, len(active) * len(variants))) as pool:
-        futures = [
-            pool.submit(fn, variant, per_variant)
-            for fn in active.values()
-            for variant in variants
-        ]
-        for future in as_completed(futures):
+    variants = [query]  # start with original; GPT variants added when ready
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        # Fire all sources with original query immediately (no GPT wait)
+        futures = {
+            pool.submit(fn, query, per_variant): (name, query)
+            for name, fn in active.items()
+        }
+        # Fire GPT expansion concurrently
+        expand_future = pool.submit(_expand_query, query)
+
+        # Collect original-query results as they arrive
+        for future in as_completed(list(futures.keys())):
             try:
                 all_papers.extend(future.result())
             except Exception:
                 pass
+
+        # Now add variant queries (GPT should be done by now)
+        try:
+            variants = expand_future.result(timeout=8)
+        except Exception:
+            variants = [query]
+
+        extra_variants = [v for v in variants if v != query]
+        if extra_variants:
+            variant_futures = [
+                pool.submit(fn, variant, per_variant)
+                for fn in active.values()
+                for variant in extra_variants
+            ]
+            for future in as_completed(variant_futures):
+                try:
+                    all_papers.extend(future.result())
+                except Exception:
+                    pass
 
     if not all_papers:
         return [], "No results from any source. Check your internet connection."
@@ -628,17 +921,24 @@ def search_papers(query: str, limit: int = 20,
             f"Try different keywords."
         )
 
-    # Step 6: semantic re-rank (embed up to 200 candidates for speed)
-    candidates = deduped[:200]
-    reranked = _rerank(query, candidates)
+    # Step 6: fast keyword pre-score to cut candidates before embedding
+    # This avoids sending hundreds of texts to the embeddings API.
+    query_words = set(re.sub(r"[^a-z0-9 ]", " ", query.lower()).split())
 
-    # Append any remaining beyond 200 unranked at the end
-    if len(deduped) > 200:
-        ranked_ids = {id(p) for p in reranked}
-        tail = [p for p in deduped[200:] if id(p) not in ranked_ids]
-        reranked = reranked + tail
+    def _keyword_score(p):
+        text = (p.get("title","") + " " + p.get("abstract","")).lower()
+        return sum(1 for w in query_words if w in text)
 
-    return reranked[:limit], None
+    # Sort by keyword overlap, take top 80 for embedding
+    presorted = sorted(deduped, key=_keyword_score, reverse=True)
+    to_embed  = presorted[:80]
+    tail      = presorted[80:]
+
+    # Step 7: semantic re-rank the top 80 by embedding similarity
+    reranked = _rerank(query, to_embed)
+
+    # Append the rest (already keyword-sorted) after the embedded results
+    return (reranked + tail)[:limit], None
 
 
 # ══════════════════════════════════════════════════════════════════════════

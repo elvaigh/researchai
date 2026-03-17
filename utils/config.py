@@ -46,6 +46,10 @@ class _Config:
         return _get("DB_OPTIONS", "")
 
     @property
+    def SERPAPI_KEY(self) -> str:
+        return _get("SERPAPI_KEY", "")
+
+    @property
     def APP_NAME(self) -> str:
         return _get("APP_NAME", "ResearchAI")
 

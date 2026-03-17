@@ -1,15 +1,16 @@
 """
-Database module — PostgreSQL via SQLAlchemy + psycopg2
-Reads credentials from st.secrets (Streamlit Cloud) or .env (local dev)
-via utils/config.py.
+Database module — PostgreSQL via psycopg2.
+Uses a persistent connection pool (ThreadedConnectionPool) so the
+expensive TLS handshake to Neon/Supabase only happens once per process,
+not on every query.
 """
 
 import os
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool as _pg_pool
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-from sqlalchemy.pool import NullPool
 
-# Load .env for local dev — ignored on Streamlit Cloud (st.secrets takes over)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 load_dotenv(os.path.join(_ROOT, ".env"), override=False)
@@ -17,41 +18,46 @@ load_dotenv(os.path.join(_ROOT, ".env"), override=False)
 from utils.config import cfg  # noqa: E402
 
 
-# ── Engine ─────────────────────────────────────────────────────────────────
+# ── Connection pool ────────────────────────────────────────────────────────
 
-def _build_url() -> str:
-    """Build the SQLAlchemy PostgreSQL connection URL from cfg."""
-    user     = cfg.DB_USER
-    password = cfg.DB_PASSWORD
-    host     = cfg.DB_HOST
-    port     = cfg.DB_PORT
-    dbname   = cfg.DB_NAME
-    # DB_OPTIONS handles Neon SNI workaround: set to "endpoint=ep-xxxx"
-    options  = cfg.DB_OPTIONS
-    url = (
-        f"postgresql+psycopg2://{user}:{password}"
-        f"@{host}:{port}/{dbname}"
-        f"?sslmode=require"
-    )
-    if options:
-        from urllib.parse import quote
-        url += f"&options={quote(options)}"
-    return url
+_pool = None
+
+def _get_pool():
+    """Return the singleton connection pool, creating it on first call."""
+    global _pool
+    if _pool is None:
+        kwargs = dict(
+            host=cfg.DB_HOST,
+            port=cfg.DB_PORT,
+            dbname=cfg.DB_NAME,
+            user=cfg.DB_USER,
+            password=cfg.DB_PASSWORD,
+            sslmode="require",
+            connect_timeout=15,
+        )
+        if cfg.DB_OPTIONS:
+            kwargs["options"] = cfg.DB_OPTIONS
+        _pool = _pg_pool.ThreadedConnectionPool(minconn=1, maxconn=5, **kwargs)
+    return _pool
 
 
-def _get_engine():
-    """
-    Return a SQLAlchemy engine with NullPool.
-    NullPool disables SQLAlchemy's own connection pool — required for Supabase
-    poolers which manage connections themselves.
-    """
-    return create_engine(_build_url(), poolclass=NullPool)
+def get_connection():
+    """Borrow a connection from the pool."""
+    return _get_pool().getconn()
+
+
+def _return(conn, error=False):
+    """Return connection to pool; close it on error so pool gets a fresh one."""
+    try:
+        _get_pool().putconn(conn, close=error)
+    except Exception:
+        pass
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _sanitise(value):
-    """Recursively strip NUL bytes (\\x00) — PostgreSQL TEXT rejects them."""
+    """Recursively strip NUL bytes — PostgreSQL TEXT rejects \\x00."""
     if isinstance(value, str):
         return value.replace("\x00", "")
     if isinstance(value, (list, tuple)):
@@ -60,339 +66,274 @@ def _sanitise(value):
 
 
 def _clean(value) -> str:
-    """Strip NUL bytes from a single string value."""
     return value.replace("\x00", "") if isinstance(value, str) else value
 
 
-def _row(mapping) -> dict:
-    """Convert a SQLAlchemy RowMapping to a plain dict."""
-    return dict(mapping) if mapping is not None else None
-
-
-def _exec(query: str, params: dict = None, fetch: str = None):
+def _exec(query: str, params=None, fetch: str = None):
     """
-    Execute a parameterised SQL query (named :param style).
+    Execute a query with %s-style params.
     fetch: None | 'one' | 'all'
     Returns: None | dict | list[dict]
     """
-    if params:
-        params = {k: _sanitise(v) for k, v in params.items()}
-
-    engine = _get_engine()
-    with engine.begin() as conn:
-        result = conn.execute(text(query), params or {})
+    if params is not None:
+        params = _sanitise(params)
+    conn = get_connection()
+    error = False
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params)
+        result = None
         if fetch == "one":
-            return _row(result.mappings().first())
-        if fetch == "all":
-            return [_row(r) for r in result.mappings().all()]
-    return None
+            row = cur.fetchone()
+            result = dict(row) if row else None
+        elif fetch == "all":
+            result = [dict(r) for r in cur.fetchall()]
+        conn.commit()
+        cur.close()
+        return result
+    except Exception:
+        conn.rollback()
+        error = True
+        raise
+    finally:
+        _return(conn, error=error)  # return to pool, don't close
 
 
 # ── Schema ─────────────────────────────────────────────────────────────────
 
 def init_db():
     """Create all tables, indexes, and run migrations."""
-    statements = [
-        """CREATE TABLE IF NOT EXISTS users (
-            id          SERIAL PRIMARY KEY,
-            email       VARCHAR(255) UNIQUE NOT NULL,
-            username    VARCHAR(100) NOT NULL,
-            password    TEXT NOT NULL,
-            created_at  TIMESTAMP DEFAULT NOW(),
-            plan        VARCHAR(50) DEFAULT 'free'
-        )""",
-        """CREATE TABLE IF NOT EXISTS workspaces (
-            id          SERIAL PRIMARY KEY,
-            user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            name        VARCHAR(255) NOT NULL,
-            description TEXT,
-            created_at  TIMESTAMP DEFAULT NOW()
-        )""",
-        """CREATE TABLE IF NOT EXISTS papers (
-            id              SERIAL PRIMARY KEY,
-            workspace_id    INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
-            user_id         INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            title           TEXT NOT NULL,
-            authors         TEXT,
-            abstract        TEXT,
-            year            VARCHAR(10),
-            doi             VARCHAR(255),
-            source          VARCHAR(100),
-            full_text       TEXT,
-            file_name       VARCHAR(255),
-            pdf_data        BYTEA,
-            tags            TEXT[],
-            notes           TEXT,
-            citation_apa    TEXT,
-            citation_bibtex TEXT,
-            created_at      TIMESTAMP DEFAULT NOW()
-        )""",
-        """CREATE TABLE IF NOT EXISTS chat_sessions (
-            id              SERIAL PRIMARY KEY,
-            workspace_id    INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
-            user_id         INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            paper_id        INTEGER REFERENCES papers(id) ON DELETE SET NULL,
-            title           VARCHAR(255),
-            created_at      TIMESTAMP DEFAULT NOW()
-        )""",
-        """CREATE TABLE IF NOT EXISTS chat_messages (
-            id          SERIAL PRIMARY KEY,
-            session_id  INTEGER REFERENCES chat_sessions(id) ON DELETE CASCADE,
-            role        VARCHAR(20) NOT NULL,
-            content     TEXT NOT NULL,
-            created_at  TIMESTAMP DEFAULT NOW()
-        )""",
-        """CREATE TABLE IF NOT EXISTS documents (
-            id              SERIAL PRIMARY KEY,
-            workspace_id    INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
-            user_id         INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            title           VARCHAR(255),
-            content         TEXT,
-            doc_type        VARCHAR(50) DEFAULT 'draft',
-            created_at      TIMESTAMP DEFAULT NOW(),
-            updated_at      TIMESTAMP DEFAULT NOW()
-        )""",
-        """CREATE TABLE IF NOT EXISTS literature_reviews (
-            id              SERIAL PRIMARY KEY,
-            workspace_id    INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
-            user_id         INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            query           TEXT NOT NULL,
-            report          TEXT,
-            paper_ids       INTEGER[],
-            created_at      TIMESTAMP DEFAULT NOW()
-        )""",
-        """CREATE TABLE IF NOT EXISTS search_history (
-            id              SERIAL PRIMARY KEY,
-            user_id         INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            query           TEXT NOT NULL,
-            results_count   INTEGER,
-            created_at      TIMESTAMP DEFAULT NOW()
-        )""",
-        "CREATE INDEX IF NOT EXISTS idx_papers_workspace        ON papers(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_papers_user             ON papers(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_chat_sessions_workspace ON chat_sessions(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_chat_messages_session   ON chat_messages(session_id)",
-        "CREATE INDEX IF NOT EXISTS idx_documents_workspace     ON documents(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_reviews_workspace       ON literature_reviews(workspace_id)",
-        # Migration: add pdf_data to existing databases
-        """DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name='papers' AND column_name='pdf_data'
-            ) THEN
-                ALTER TABLE papers ADD COLUMN pdf_data BYTEA;
-            END IF;
-        END$$""",
-    ]
-    engine = _get_engine()
-    with engine.begin() as conn:
-        for stmt in statements:
-            conn.execute(text(stmt))
+    conn = get_connection()
+    error = False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                username VARCHAR(100) NOT NULL,
+                password TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                plan VARCHAR(50) DEFAULT 'free'
+            );
+            CREATE TABLE IF NOT EXISTS workspaces (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                name VARCHAR(255) NOT NULL,
+                description TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS papers (
+                id SERIAL PRIMARY KEY,
+                workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                authors TEXT, abstract TEXT, year VARCHAR(10),
+                doi VARCHAR(255), source VARCHAR(100),
+                full_text TEXT, file_name VARCHAR(255), pdf_data BYTEA,
+                tags TEXT[], notes TEXT,
+                citation_apa TEXT, citation_bibtex TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id SERIAL PRIMARY KEY,
+                workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                paper_id INTEGER REFERENCES papers(id) ON DELETE SET NULL,
+                title VARCHAR(255),
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id SERIAL PRIMARY KEY,
+                session_id INTEGER REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                role VARCHAR(20) NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS documents (
+                id SERIAL PRIMARY KEY,
+                workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                title VARCHAR(255), content TEXT,
+                doc_type VARCHAR(50) DEFAULT 'draft',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS literature_reviews (
+                id SERIAL PRIMARY KEY,
+                workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                query TEXT NOT NULL, report TEXT,
+                paper_ids INTEGER[],
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS search_history (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                query TEXT NOT NULL, results_count INTEGER,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_papers_workspace
+                ON papers(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_papers_user
+                ON papers(user_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_workspace
+                ON chat_sessions(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session
+                ON chat_messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_documents_workspace
+                ON documents(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_reviews_workspace
+                ON literature_reviews(workspace_id);
+        """)
+        # Migration: add pdf_data if missing
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='papers' AND column_name='pdf_data'
+                ) THEN
+                    ALTER TABLE papers ADD COLUMN pdf_data BYTEA;
+                END IF;
+            END$$;
+        """)
+        conn.commit()
+        cur.close()
+    except Exception:
+        conn.rollback()
+        error = True
+        raise
+    finally:
+        _return(conn, error=error)
 
 
 # ── Users ──────────────────────────────────────────────────────────────────
 
-def create_user(email: str, username: str, hashed_password: str) -> dict:
+def create_user(email, username, hashed_password):
     return _exec(
-        "INSERT INTO users (email, username, password) "
-        "VALUES (:email, :username, :password) RETURNING *",
-        {"email": email, "username": username, "password": hashed_password},
-        fetch="one",
-    )
+        "INSERT INTO users (email,username,password) VALUES (%s,%s,%s) RETURNING *",
+        (email, username, hashed_password), fetch="one")
 
+def get_user_by_email(email):
+    return _exec("SELECT * FROM users WHERE email=%s", (email,), fetch="one")
 
-def get_user_by_email(email: str):
-    return _exec(
-        "SELECT * FROM users WHERE email = :email",
-        {"email": email}, fetch="one",
-    )
-
-
-def get_user_by_id(user_id: int):
-    return _exec(
-        "SELECT * FROM users WHERE id = :id",
-        {"id": user_id}, fetch="one",
-    )
+def get_user_by_id(user_id):
+    return _exec("SELECT * FROM users WHERE id=%s", (user_id,), fetch="one")
 
 
 # ── Workspaces ─────────────────────────────────────────────────────────────
 
-def create_workspace(user_id: int, name: str, description: str = "") -> dict:
+def create_workspace(user_id, name, description=""):
     return _exec(
-        "INSERT INTO workspaces (user_id, name, description) "
-        "VALUES (:uid, :name, :desc) RETURNING *",
-        {"uid": user_id, "name": name, "desc": description},
-        fetch="one",
-    )
+        "INSERT INTO workspaces (user_id,name,description) VALUES (%s,%s,%s) RETURNING *",
+        (user_id, name, description), fetch="one")
 
-
-def get_workspaces(user_id: int) -> list:
+def get_workspaces(user_id):
     return _exec(
-        "SELECT * FROM workspaces WHERE user_id = :uid ORDER BY created_at DESC",
-        {"uid": user_id}, fetch="all",
-    ) or []
+        "SELECT * FROM workspaces WHERE user_id=%s ORDER BY created_at DESC",
+        (user_id,), fetch="all") or []
 
-
-def delete_workspace(ws_id: int, user_id: int):
-    _exec(
-        "DELETE FROM workspaces WHERE id = :id AND user_id = :uid",
-        {"id": ws_id, "uid": user_id},
-    )
+def delete_workspace(ws_id, user_id):
+    _exec("DELETE FROM workspaces WHERE id=%s AND user_id=%s", (ws_id, user_id))
 
 
 # ── Papers ─────────────────────────────────────────────────────────────────
 
-def save_paper(workspace_id: int, user_id: int, data: dict) -> dict:
-    return _exec(
-        """
+def save_paper(workspace_id, user_id, data):
+    return _exec("""
         INSERT INTO papers
             (workspace_id, user_id, title, authors, abstract, year, doi,
              source, full_text, file_name, pdf_data, tags, notes,
              citation_apa, citation_bibtex)
-        VALUES
-            (:ws, :uid, :title, :authors, :abstract, :year, :doi,
-             :source, :full_text, :file_name, :pdf_data, :tags, :notes,
-             :apa, :bibtex)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING *
-        """,
-        {
-            "ws":        workspace_id,
-            "uid":       user_id,
-            "title":     _clean(data.get("title", "Untitled")),
-            "authors":   _clean(data.get("authors", "")),
-            "abstract":  _clean(data.get("abstract", "")),
-            "year":      _clean(data.get("year", "")),
-            "doi":       _clean(data.get("doi", "")),
-            "source":    _clean(data.get("source", "manual")),
-            "full_text": _clean(data.get("full_text", "")),
-            "file_name": _clean(data.get("file_name", "")),
-            "pdf_data":  data.get("pdf_data"),
-            "tags":      data.get("tags", []),
-            "notes":     _clean(data.get("notes", "")),
-            "apa":       _clean(data.get("citation_apa", "")),
-            "bibtex":    _clean(data.get("citation_bibtex", "")),
-        },
-        fetch="one",
-    )
+        """, (
+        workspace_id, user_id,
+        _clean(data.get("title","Untitled")),
+        _clean(data.get("authors","")),
+        _clean(data.get("abstract","")),
+        _clean(data.get("year","")),
+        _clean(data.get("doi","")),
+        _clean(data.get("source","manual")),
+        _clean(data.get("full_text","")),
+        _clean(data.get("file_name","")),
+        data.get("pdf_data"),
+        data.get("tags",[]),
+        _clean(data.get("notes","")),
+        _clean(data.get("citation_apa","")),
+        _clean(data.get("citation_bibtex","")),
+    ), fetch="one")
 
-
-def get_papers(workspace_id: int) -> list:
+def get_papers(workspace_id):
     return _exec(
-        "SELECT * FROM papers WHERE workspace_id = :ws ORDER BY created_at DESC",
-        {"ws": workspace_id}, fetch="all",
-    ) or []
+        "SELECT * FROM papers WHERE workspace_id=%s ORDER BY created_at DESC",
+        (workspace_id,), fetch="all") or []
 
+def get_paper(paper_id):
+    return _exec("SELECT * FROM papers WHERE id=%s", (paper_id,), fetch="one")
 
-def get_paper(paper_id: int):
-    return _exec(
-        "SELECT * FROM papers WHERE id = :id",
-        {"id": paper_id}, fetch="one",
-    )
+def update_paper_notes(paper_id, notes):
+    _exec("UPDATE papers SET notes=%s WHERE id=%s", (notes, paper_id))
 
-
-def update_paper_notes(paper_id: int, notes: str):
-    _exec(
-        "UPDATE papers SET notes = :notes WHERE id = :id",
-        {"notes": notes, "id": paper_id},
-    )
-
-
-def delete_paper(paper_id: int, user_id: int):
-    _exec(
-        "DELETE FROM papers WHERE id = :id AND user_id = :uid",
-        {"id": paper_id, "uid": user_id},
-    )
+def delete_paper(paper_id, user_id):
+    _exec("DELETE FROM papers WHERE id=%s AND user_id=%s", (paper_id, user_id))
 
 
 # ── Chat ───────────────────────────────────────────────────────────────────
 
-def create_chat_session(workspace_id: int, user_id: int,
-                        paper_id=None, title: str = "New Chat") -> dict:
+def create_chat_session(workspace_id, user_id, paper_id=None, title="New Chat"):
     return _exec(
-        "INSERT INTO chat_sessions (workspace_id, user_id, paper_id, title) "
-        "VALUES (:ws, :uid, :pid, :title) RETURNING *",
-        {"ws": workspace_id, "uid": user_id, "pid": paper_id, "title": title},
-        fetch="one",
-    )
+        "INSERT INTO chat_sessions (workspace_id,user_id,paper_id,title) VALUES (%s,%s,%s,%s) RETURNING *",
+        (workspace_id, user_id, paper_id, title), fetch="one")
 
+def get_chat_sessions(workspace_id):
+    return _exec("""
+        SELECT cs.*, p.title AS paper_title
+        FROM chat_sessions cs
+        LEFT JOIN papers p ON cs.paper_id = p.id
+        WHERE cs.workspace_id=%s ORDER BY cs.created_at DESC
+        """, (workspace_id,), fetch="all") or []
 
-def get_chat_sessions(workspace_id: int) -> list:
+def save_message(session_id, role, content):
     return _exec(
-        """SELECT cs.*, p.title AS paper_title
-           FROM   chat_sessions cs
-           LEFT JOIN papers p ON cs.paper_id = p.id
-           WHERE  cs.workspace_id = :ws
-           ORDER  BY cs.created_at DESC""",
-        {"ws": workspace_id}, fetch="all",
-    ) or []
+        "INSERT INTO chat_messages (session_id,role,content) VALUES (%s,%s,%s) RETURNING *",
+        (session_id, role, content), fetch="one")
 
-
-def save_message(session_id: int, role: str, content: str) -> dict:
+def get_messages(session_id):
     return _exec(
-        "INSERT INTO chat_messages (session_id, role, content) "
-        "VALUES (:sid, :role, :content) RETURNING *",
-        {"sid": session_id, "role": role, "content": content},
-        fetch="one",
-    )
-
-
-def get_messages(session_id: int) -> list:
-    return _exec(
-        "SELECT * FROM chat_messages WHERE session_id = :sid ORDER BY created_at ASC",
-        {"sid": session_id}, fetch="all",
-    ) or []
+        "SELECT * FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC",
+        (session_id,), fetch="all") or []
 
 
 # ── Documents ──────────────────────────────────────────────────────────────
 
-def save_document(workspace_id: int, user_id: int,
-                  title: str, content: str, doc_type: str = "draft") -> dict:
+def save_document(workspace_id, user_id, title, content, doc_type="draft"):
     return _exec(
-        "INSERT INTO documents (workspace_id, user_id, title, content, doc_type) "
-        "VALUES (:ws, :uid, :title, :content, :doc_type) RETURNING *",
-        {"ws": workspace_id, "uid": user_id,
-         "title": title, "content": content, "doc_type": doc_type},
-        fetch="one",
-    )
+        "INSERT INTO documents (workspace_id,user_id,title,content,doc_type) VALUES (%s,%s,%s,%s,%s) RETURNING *",
+        (workspace_id, user_id, title, content, doc_type), fetch="one")
 
-
-def get_documents(workspace_id: int) -> list:
+def get_documents(workspace_id):
     return _exec(
-        "SELECT * FROM documents WHERE workspace_id = :ws ORDER BY updated_at DESC",
-        {"ws": workspace_id}, fetch="all",
-    ) or []
+        "SELECT * FROM documents WHERE workspace_id=%s ORDER BY updated_at DESC",
+        (workspace_id,), fetch="all") or []
 
+def update_document(doc_id, title, content):
+    _exec("UPDATE documents SET title=%s,content=%s,updated_at=NOW() WHERE id=%s",
+          (title, content, doc_id))
 
-def update_document(doc_id: int, title: str, content: str):
-    _exec(
-        "UPDATE documents SET title=:title, content=:content, updated_at=NOW() WHERE id=:id",
-        {"title": title, "content": content, "id": doc_id},
-    )
-
-
-def delete_document(doc_id: int, user_id: int):
-    _exec(
-        "DELETE FROM documents WHERE id = :id AND user_id = :uid",
-        {"id": doc_id, "uid": user_id},
-    )
+def delete_document(doc_id, user_id):
+    _exec("DELETE FROM documents WHERE id=%s AND user_id=%s", (doc_id, user_id))
 
 
 # ── Literature Reviews ─────────────────────────────────────────────────────
 
-def save_literature_review(workspace_id: int, user_id: int,
-                            query: str, report: str, paper_ids: list) -> dict:
+def save_literature_review(workspace_id, user_id, query, report, paper_ids):
     return _exec(
-        "INSERT INTO literature_reviews (workspace_id, user_id, query, report, paper_ids) "
-        "VALUES (:ws, :uid, :query, :report, :pids) RETURNING *",
-        {"ws": workspace_id, "uid": user_id,
-         "query": query, "report": report, "pids": paper_ids},
-        fetch="one",
-    )
+        "INSERT INTO literature_reviews (workspace_id,user_id,query,report,paper_ids) VALUES (%s,%s,%s,%s,%s) RETURNING *",
+        (workspace_id, user_id, query, report, paper_ids), fetch="one")
 
-
-def get_literature_reviews(workspace_id: int) -> list:
+def get_literature_reviews(workspace_id):
     return _exec(
-        "SELECT * FROM literature_reviews WHERE workspace_id = :ws ORDER BY created_at DESC",
-        {"ws": workspace_id}, fetch="all",
-    ) or []
+        "SELECT * FROM literature_reviews WHERE workspace_id=%s ORDER BY created_at DESC",
+        (workspace_id,), fetch="all") or []
